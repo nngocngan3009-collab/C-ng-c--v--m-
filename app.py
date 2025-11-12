@@ -25,6 +25,8 @@ except Exception:
 WB_BASE = "https://api.worldbank.org/v2"
 HEADERS = {"User-Agent": "Streamlit-WB-Client/1.0 (contact: you@example.com)",
            "Accept": "application/json"}
+VECTOR_SEARCH_URL = "https://data360api.worldbank.org/data360/searchv2"
+VECTOR_HEADERS = {"Content-Type": "application/json", "Accept": "*/*"}
 REQ_TIMEOUT = 60
 MAX_RETRIES = 4
 BACKOFF     = 1.6
@@ -52,6 +54,23 @@ def http_get_json(url: str, params: Dict[str, Any]) -> Any:
             time.sleep(_sleep(attempt))
     raise RuntimeError(f"GET {url} failed after retries: {last_err}")
 
+
+def http_post_json(url: str, payload: Dict[str, Any]) -> Any:
+    last_err = None
+    headers = HEADERS.copy()
+    headers.update(VECTOR_HEADERS)
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=REQ_TIMEOUT)
+            if r.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(_sleep(attempt))
+    raise RuntimeError(f"POST {url} failed after retries: {last_err}")
+
 # =========================
 # Indicator utilities
 # =========================
@@ -65,37 +84,47 @@ def is_valid_wb_id(candidate: str) -> bool:
     return bool(_VALID_WB_ID.match(c))
 
 
+def normalize_indicator_code(raw_id: str) -> Optional[str]:
+    if not isinstance(raw_id, str):
+        return None
+    parts = [p.strip().upper() for p in raw_id.split("_") if p and p.strip()]
+    if len(parts) < 3:
+        return None
+    candidate = ".".join(parts[2:])
+    return candidate if is_valid_wb_id(candidate) else None
+
+
 @st.cache_data(show_spinner=False, ttl=24*3600)
-def wb_search_indicators(keyword: str, max_pages: int = 2) -> pd.DataFrame:
-    results, page = [], 1
-    key = (keyword or "").strip().lower()
-    while page <= max_pages:
-        js = http_get_json(f"{WB_BASE}/indicator", {"format":"json","per_page":5000,"page":page})
-        if not isinstance(js, list) or len(js) < 2:
-            break
-        meta, data = js
-        per_page = int((meta or {}).get("per_page", 0) or 0)
-        total    = int((meta or {}).get("total", 0) or 0)
-        for it in (data or []):
-            _id, _name = it.get("id", ""), it.get("name", "")
-            _source = (it.get("source", {}) or {}).get("value", "")
-            if _source.strip() != "World Development Indicators":
-                continue
-            if key and (key not in _name.lower() and key not in _id.lower()):
-                continue
-            if not is_valid_wb_id(_id):
-                continue
-            results.append({
-                "id": _id,
-                "name": _name,
-                "unit": it.get("unit", ""),
-                "source": _source
-            })
-        if page * per_page >= total or per_page == 0:
-            break
-        page += 1
-    df = pd.DataFrame(results).drop_duplicates(subset=["id"]).sort_values("name").reset_index(drop=True)
-    return df
+def wb_search_indicators(keyword: str, top: int = 50) -> pd.DataFrame:
+    key = (keyword or "").strip()
+    if not key:
+        return pd.DataFrame(columns=["id", "name", "source", "score", "raw_id"])
+    payload = {
+        "count": True,
+        "select": "series_description/idno, series_description/name, series_description/database_id",
+        "search": key,
+        "top": int(max(1, min(top, 500)))
+    }
+    js = http_post_json(VECTOR_SEARCH_URL, payload)
+    values = js.get("value", []) if isinstance(js, dict) else []
+    rows: List[Dict[str, Any]] = []
+    for item in values:
+        series = item.get("series_description") or {}
+        raw_id = (series.get("idno") or "").strip()
+        indicator_id = normalize_indicator_code(raw_id)
+        if not indicator_id:
+            continue
+        rows.append({
+            "id": indicator_id,
+            "raw_id": raw_id,
+            "name": (series.get("name") or "").strip(),
+            "source": (series.get("database_id") or "").strip(),
+            "score": float(item.get("@search.score", 0.0) or 0.0),
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.drop_duplicates(subset=["id"]).sort_values("score", ascending=False).reset_index(drop=True)
 
 # =========================
 # Fetch series
@@ -134,7 +163,13 @@ def pivot_wide(df_long: pd.DataFrame, use_friendly_name: bool, id_to_name: Dict[
     df = df_long.copy()
     if use_friendly_name:
         df["IndicatorName"] = df["IndicatorID"].map(id_to_name).fillna(df["IndicatorID"])
-    wide = df.pivot_table(index=["Year","Country"], columns=key_col, values="Value", aggfunc="first")
+    wide = df.pivot_table(
+        index=["Year","Country"],
+        columns=key_col,
+        values="Value",
+        aggfunc="first",
+        dropna=False
+    )
     wide = wide.reset_index().sort_values(["Country","Year"])
     wide = wide.rename(columns={"Year": "Năm"})
     return wide
@@ -174,6 +209,9 @@ st.set_page_config(page_title="World Bank WDI — Sửa python7", layout="wide")
 st.title("Công cụ tổng hợp và phân tích dữ liệu vĩ mô kết hợp AI")
 st.caption("Tìm indicator (WDI, lọc ID hợp lệ) → Lấy dữ liệu qua API v2 → Bảng rộng: Năm, Country, chỉ số…")
 
+if "indicator_results" not in st.session_state:
+    st.session_state["indicator_results"] = pd.DataFrame()
+
 # ===== Sidebar: Tool tìm indicator, chọn năm, Xử lý N/A, Quốc gia =====
 with st.sidebar:
     st.header("🔧 Công cụ")
@@ -181,7 +219,7 @@ with st.sidebar:
     country_raw = st.text_input("Country codes (ISO2/3, ',' tách)", value="VN")
 
     # Tìm indicator
-    st.subheader("Tìm chỉ số (WDI)")
+    st.subheader("Tìm chỉ số (vector search)")
     kw = st.text_input("Từ khoá", value="GDP")
     top_n = st.number_input("Top", 1, 500, 50, 1)
     do_search = st.button("🔍 Tìm indicator")
@@ -190,14 +228,22 @@ with st.sidebar:
         if not kw.strip():
             st.warning("Nhập từ khoá trước khi tìm.")
         else:
-            with st.spinner("Đang tìm indicators (WDI)…"):
-                df_ind = wb_search_indicators(kw.strip(), max_pages=3)
-                if top_n:
-                    df_ind = df_ind.head(int(top_n))
-                st.session_state["ind_search_df"] = df_ind
+            with st.spinner("Đang tìm indicators (vector search)…"):
+                try:
+                    df_ind = wb_search_indicators(kw.strip(), top=int(top_n))
+                except Exception as exc:
+                    st.error(f"Lỗi tìm kiếm: {exc}")
+                    df_ind = pd.DataFrame()
+                if df_ind.empty:
+                    st.info("Không tìm thấy chỉ số phù hợp.")
+                else:
+                    df_ind = df_ind.copy()
+                    if "selected" not in df_ind.columns:
+                        df_ind.insert(0, "selected", False)
+                st.session_state["indicator_results"] = df_ind
 
     # Khoảng năm + xử lý NA
-    y_from, y_to = st.slider("Khoảng năm", 2000, 2025, DEFAULT_DATE_RANGE)
+    y_from, y_to = st.slider("Khoảng năm", 1995, 2025, DEFAULT_DATE_RANGE)
     na_method = st.selectbox(
         "Xử lý N/A",
         [
@@ -217,33 +263,49 @@ TAB_TITLES = ["📊 Dữ liệu", "📈 Biểu đồ", "🧮 Thống kê", "📥
 tab1, tab2, tab3, tab4, tab5 = st.tabs(TAB_TITLES)
 
 # Tải kết quả tìm kiếm để chọn indicator
-ind_df = st.session_state.get("ind_search_df", pd.DataFrame())
-name_to_id = {row["name"]: row["id"] for _, row in (ind_df if not ind_df.empty else pd.DataFrame()).iterrows()}
-id_to_name = {v: k for k, v in name_to_id.items()}
-indicator_names = ind_df["name"].tolist() if not ind_df.empty else []
+ind_df = st.session_state.get("indicator_results", pd.DataFrame())
+if not ind_df.empty and "selected" not in ind_df.columns:
+    ind_df = ind_df.copy()
+    ind_df.insert(0, "selected", False)
+    st.session_state["indicator_results"] = ind_df
+ind_df = st.session_state.get("indicator_results", pd.DataFrame())
+id_to_name: Dict[str, str] = {}
+if not ind_df.empty and {"id", "name"}.issubset(ind_df.columns):
+    id_to_name = dict(zip(ind_df["id"], ind_df["name"]))
 
 with tab1:
-    st.subheader("Chọn chỉ số từ kết quả tìm kiếm (WDI)")
+    st.subheader("Chọn chỉ số từ kết quả tìm kiếm (vector)")
     if ind_df.empty:
-        st.info("Hãy dùng thanh bên trái để *Tìm indicator*. Chỉ số hiển thị là từ WDI và đã lọc ID sai định dạng.")
+        st.info("Hãy dùng thanh bên trái để *Tìm indicator*.")
     else:
-        st.dataframe(ind_df[["id","name","unit","source"]], height=220, use_container_width=True)
-    selected_indicator_names = st.multiselect(
-        "Chọn chỉ số theo TÊN (sẽ tự lắp ID vào API)",
-        options=indicator_names,
-        default=indicator_names[:1] if indicator_names else []
-    )
-    use_friendly = st.checkbox("Dùng tên chỉ số làm tiêu đề cột (thay vì ID)", value=False)
+        editor_df = ind_df[["selected", "name", "source"]].copy()
+        edited_df = st.data_editor(
+            editor_df,
+            hide_index=True,
+            use_container_width=True,
+            num_rows="fixed",
+            column_config={
+                "selected": st.column_config.CheckboxColumn("Tick"),
+                "name": st.column_config.TextColumn("Tên indicator", disabled=True),
+                "source": st.column_config.TextColumn("Source", disabled=True),
+            },
+            disabled=["name", "source"],
+            key="indicator_selector",
+        )
+        st.session_state["indicator_results"].loc[edited_df.index, "selected"] = edited_df["selected"].astype(bool)
+        ind_df = st.session_state["indicator_results"]
+        if not ind_df.empty and {"id", "name"}.issubset(ind_df.columns):
+            id_to_name = dict(zip(ind_df["id"], ind_df["name"]))
 
     if load_clicked:
-        if not selected_indicator_names:
+        if ind_df.empty or "selected" not in ind_df.columns or not ind_df["selected"].any():
             st.warning("Chọn ít nhất một chỉ số.")
             st.stop()
         if country_raw.strip().upper() == "ALL":
             country_list = ["all"]
         else:
             country_list = [c.strip() for c in country_raw.split(",") if c.strip()]
-        chosen_ids = [name_to_id.get(n) for n in selected_indicator_names]
+        chosen_ids = ind_df.loc[ind_df["selected"], "id"].tolist()
         chosen_ids = [cid for cid in chosen_ids if cid and is_valid_wb_id(cid)]
         if not chosen_ids:
             st.error("Không có ID hợp lệ sau khi lọc.")
@@ -260,14 +322,14 @@ with tab1:
             st.info("Không có dữ liệu phù hợp.")
             st.stop()
         df_long = pd.concat(all_long, ignore_index=True)
-        df_wide = pivot_wide(df_long, use_friendly_name=use_friendly, id_to_name=id_to_name)
+        df_wide = pivot_wide(df_long, use_friendly_name=True, id_to_name=id_to_name)
         df_wide = handle_na(df_wide, na_method)
         st.session_state["wb_df_wide"] = df_wide
         st.success("✅ Đã tải và hợp nhất dữ liệu.")
 
     df_show = st.session_state.get("wb_df_wide", pd.DataFrame())
     if not df_show.empty:
-        st.dataframe(df_show.set_index(["Country","Năm"]), use_container_width=True)
+        st.dataframe(df_show.set_index(["Country", "Năm"]), use_container_width=True)
 
 
 def _get_df_wide() -> pd.DataFrame:
